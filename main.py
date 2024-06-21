@@ -24,9 +24,10 @@ class ModelConfig:
     tokenizer: AutoTokenizer
 
 class SafetyAwareMerger:
-    def __init__(self, base_model_name: str, expert_model_names: List[str], device: torch.device):
+    def __init__(self, base_model_name: str, expert_model_names: List[str], device: torch.device, hf_token: str):
         logger.debug(f"Initializing SafetyAwareMerger with base model: {base_model_name}")
         self.device = device
+        self.hf_token = hf_token
         self.base_model = self.load_model(base_model_name)
         self.expert_models = [self.load_model(name) for name in expert_model_names]
         self.merged_model = None
@@ -34,11 +35,17 @@ class SafetyAwareMerger:
         self.safety_classifier = pipeline("text-classification", model="facebook/roberta-hate-speech-dynabench-r4-target", device=device)
         logger.debug("SafetyAwareMerger initialized")
 
-    @staticmethod
-    def load_model(model_name: str) -> ModelConfig:
+    def load_model(self, model_name: str) -> ModelConfig:
         logger.debug(f"Loading model: {model_name}")
-        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16)
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name, 
+            torch_dtype=torch.float16,
+            use_auth_token=self.hf_token
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            use_auth_token=self.hf_token
+        )
         logger.debug(f"Model {model_name} loaded successfully")
         return ModelConfig(model_name, model, tokenizer)
 
@@ -165,14 +172,15 @@ def run_merger(rank: int, world_size: int):
     logger.debug(f"Using device: {device}")
     
     merger = SafetyAwareMerger(
-        "mistralai/Mistral-7B-Instruct-v0.2",
+        "gpt2",  # Use a publicly accessible model like GPT-2
         ["microsoft/BioGPT-Large", "EleutherAI/gpt-neox-20b"],
-        device
+        device,
+        hf_token="your_hugging_face_token"  # Include your Hugging Face token here
     )
     
     logger.debug("Generating safety and domain data")
-    safety_data = merger.generate_safety_data(num_samples=1000)
-    domain_data = merger.generate_domain_data(num_samples=1000)
+    safety_data = merger.generate_safety_data(num_samples=100)
+    domain_data = merger.generate_domain_data(num_samples=100)
     
     # Wrap models in DDP
     logger.debug("Wrapping models in DistributedDataParallel")
@@ -198,9 +206,10 @@ def run_merger_simple():
     logger.debug(f"Using device: {device}")
     
     merger = SafetyAwareMerger(
-        "mistralai/Mistral-7B-Instruct-v0.2",
+        "gpt2",  # Use a publicly accessible model like GPT-2
         ["microsoft/BioGPT-Large", "EleutherAI/gpt-neox-20b"],
-        device
+        device,
+        hf_token=""  # Include your Hugging Face token here
     )
     
     logger.debug("Generating safety and domain data")
