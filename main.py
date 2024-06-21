@@ -52,7 +52,7 @@ class SafetyAwareMerger:
     def generate_safety_data(self, num_samples: int = 100) -> List[Tuple[str, str]]:
         logger.debug(f"Generating safety data with {num_samples} samples")
         dataset = load_dataset("allenai/real-toxicity-prompts", split="train")
-        unsafe_queries = random.sample(dataset["text"], num_samples)
+        unsafe_queries = random.sample(dataset["prompt"], num_samples)
         
         safety_data = []
         for query in tqdm(unsafe_queries, desc="Generating safety data"):
@@ -74,7 +74,7 @@ class SafetyAwareMerger:
         
         domain_data = []
         for dataset in datasets:
-            for item in tqdm(random.sample(dataset, num_samples // len(datasets)), desc=f"Generating data for {dataset.name}"):
+            for item in tqdm(random.sample(list(dataset), num_samples // len(datasets)), desc=f"Generating data for {dataset.name}"):
                 question = item['question']
                 answer = item.get('answer', item.get('correct'))
                 for model in self.expert_models:
