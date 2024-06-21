@@ -22,7 +22,7 @@ This project addresses the critical issue of maintaining safety alignment when m
 
 ```bash
 git clone https://github.com/sanowl/SafeMerge-Advanced-Safety-Aware-Model-Merging-for-Large-Language-Models.git
-cd SafeMerge-Advanced-Safety-Aware-Model-Merging-for-Large-Language-Models
+
 pip install -r requirements.txt
 ```
 
