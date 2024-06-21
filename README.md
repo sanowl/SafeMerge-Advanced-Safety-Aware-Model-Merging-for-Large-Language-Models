@@ -83,5 +83,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 SafeMerge is an implementation of advanced AI techniques and should be used responsibly. While it aims to improve safety in merged models, it does not guarantee complete safety or alignment. Users should always carefully evaluate the output of AI models, especially in sensitive applications.
 ```
-
-This README has been updated to reflect the new repository name and URL. It provides a comprehensive overview of the SafeMerge project, including its purpose, key features, installation instructions, basic usage example, requirements, citation information, contribution guidelines, license, acknowledgments, and a disclaimer about responsible use.
