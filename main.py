@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass
 from functools import partial
 from typing import List, Tuple, Dict, Optional
-
+import sagemaker
 import numpy as np
 import torch
 import torch.multiprocessing as mp
@@ -23,45 +23,40 @@ import wandb
 from sklearn.metrics import accuracy_score, f1_score
 from sentence_transformers import SentenceTransformer, util
 
+# AWS imports
+import boto3
+import botocore
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-@dataclass
 class ModelConfig:
-    name: str
-    model: AutoModelForCausalLM
-    tokenizer: AutoTokenizer
+    def __init__(self, name: str, model: AutoModelForCausalLM, tokenizer: AutoTokenizer):
+        self.name = name
+        self.model = model
+        self.tokenizer = tokenizer
 
 class SafetyAwareMerger:
-    def __init__(
-        self,
-        base_model_name: str,
-        expert_model_names: List[str],
-        device: torch.device,
-        hf_token: str
-    ):
+    def __init__(self, base_model_name: str, expert_model_names: List[str], device: torch.device, hf_token: str):
         self.device = device
         self.hf_token = hf_token
         self.base_model = self._load_model(base_model_name)
         self.expert_models = [self._load_model(name) for name in expert_model_names]
         self.merged_model: Optional[AutoModelForCausalLM] = None
-        self.safety_classifier = pipeline(
-            "text-classification",
-            model="facebook/roberta-hate-speech-dynabench-r4-target",
-            device=device
-        )
+        self.safety_classifier = self._load_safety_classifier()
         self.sentence_transformer = SentenceTransformer('all-MiniLM-L6-v2').to(device)
 
     def _load_model(self, model_name: str) -> ModelConfig:
         logger.info(f"Loading model: {model_name}")
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.float16,
-            use_auth_token=self.hf_token
-        ).to(self.device)
+        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16, use_auth_token=self.hf_token).to(self.device)
         tokenizer = AutoTokenizer.from_pretrained(model_name, use_auth_token=self.hf_token)
         return ModelConfig(model_name, model, tokenizer)
+
+    def _load_safety_classifier(self):
+        from transformers import pipeline
+        return pipeline("text-classification", model="facebook/roberta-hate-speech-dynabench-r4-target", device=self.device)
+    
 
     def generate_safety_data(self, num_samples: int = 100) -> List[Tuple[str, str]]:
         logger.info(f"Generating safety data with {num_samples} samples")
@@ -136,7 +131,6 @@ class SafetyAwareMerger:
                 expert_param = dict(expert_model.model.named_parameters())[param_name]
                 merged_param += expert_param * lambdas[i+1]
             
-            # Apply EWC regularization
             if param_name in fisher_importance:
                 ewc_term = fisher_importance[param_name] * (merged_param - base_param) ** 2
                 merged_param -= 0.5 * ewc_term  # Adjust the strength of EWC as needed
@@ -274,52 +268,36 @@ class SafetyAwareMerger:
         self.base_model.tokenizer.save_pretrained(output_dir)
         logger.info("Model saved successfully")
 
-def setup_distributed(rank: int, world_size: int):
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
-    torch.distributed.init_process_group("nccl", rank=rank, world_size=world_size)
-
-def cleanup_distributed():
-    torch.distributed.destroy_process_group()
+def setup_sagemaker_environment(args):
+    session = boto3.Session(region_name=args.aws_region)
+    sagemaker_session = sagemaker.Session(boto_session=session)
     
-def run_merger(rank: int, world_size: int, args: argparse.Namespace):
-    logger.info(f"Starting merger run. Rank: {rank}, World Size: {world_size}")
-    setup_distributed(rank, world_size)
+    role = sagemaker.get_execution_role()
     
-    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
+    pytorch_estimator = PyTorch(
+        entry_point='sagemaker_script.py',
+        role=role,
+        instance_count=1,
+        instance_type=args.sagemaker_instance_type,
+        framework_version='1.8.1',
+        py_version='py3',
+        hyperparameters={
+            'base_model': args.base_model,
+            'expert_models': ' '.join(args.expert_models),
+            'hf_token': args.hf_token,
+            'num_samples': args.num_samples,
+            'merge_method': args.merge_method,
+            'fine_tune': args.fine_tune,
+            'fine_tune_dataset': args.fine_tune_dataset,
+            'fine_tune_epochs': args.fine_tune_epochs,
+            'save_model': args.save_model,
+            'output_dir': args.output_dir
+        }
+    )
     
-    wandb.init(project="safety-aware-merger", config=args)
+    pytorch_estimator.fit()
     
-    merger = SafetyAwareMerger(args.base_model, args.expert_models, device, args.hf_token)
-    
-    safety_data = merger.generate_safety_data(num_samples=args.num_samples)
-    domain_data = merger.generate_domain_data(num_samples=args.num_samples)
-    
-    # Wrap models in DDP
-    merger.base_model.model = DDP(merger.base_model.model, device_ids=[rank])
-    merger.expert_models = [ModelConfig(model.name, DDP(model.model, device_ids=[rank]), model.tokenizer) for model in merger.expert_models]
-    
-    optimal_params = merger.evomm_optimize(safety_data, domain_data, merge_method=args.merge_method)
-    
-    if args.merge_method == 'dare_ties':
-        merger.dare_ties_merge(optimal_params[:-1], optimal_params[-1])
-    elif args.merge_method == 'ewc':
-        fisher_importance = merger.compute_fisher_importance()
-        merger.elastic_weight_consolidation(optimal_params[:-1], fisher_importance)
-    
-    if args.fine_tune:
-        merger.fine_tune(args.fine_tune_dataset, args.fine_tune_epochs)
-    
-    safety_score, domain_scores, avg_semantic_similarity = merger.evaluate_model(merger.merged_model, safety_data, domain_data)
-    logger.info(f"Final Merged Model - Safety: {safety_score:.2f}, Domain Performances: {domain_scores}, Avg Semantic Similarity: {avg_semantic_similarity}")
-    logger.info(f"Optimal parameters: {optimal_params}")
-    
-    if args.save_model:
-        merger.save_model(args.output_dir)
-    
-    wandb.finish()
-    cleanup_distributed()
+    logger.info("SageMaker training job completed")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Safety-Aware Model Merger")
@@ -333,20 +311,41 @@ def parse_args():
     parser.add_argument("--fine_tune_epochs", type=int, default=3, help="Number of epochs for fine-tuning")
     parser.add_argument("--save_model", action="store_true", help="Whether to save the merged model")
     parser.add_argument("--output_dir", type=str, default="./merged_model", help="Directory to save the merged model")
+    parser.add_argument("--use_sagemaker", action="store_true", help="Whether to use Amazon SageMaker for computation")
+    parser.add_argument("--aws_region", type=str, default="us-west-2", help="AWS region")
+    parser.add_argument("--sagemaker_instance_type", type=str, default="ml.p3.2xlarge", help="SageMaker instance type")
     return parser.parse_args()
 
 def main():
     args = parse_args()
     
-    world_size = torch.cuda.device_count()
-    logger.info(f"Number of available GPUs: {world_size}")
-    
-    if world_size > 1:
-        logger.info("Running distributed merger")
-        mp.spawn(run_merger, args=(world_size, args), nprocs=world_size, join=True)
+    if args.use_sagemaker:
+        logger.info("Setting up SageMaker environment")
+        setup_sagemaker_environment(args)
     else:
-        logger.info("Running simple merger")
-        run_merger(0, 1, args)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        merger = SafetyAwareMerger(args.base_model, args.expert_models, device, args.hf_token)
+        
+        safety_data = merger.generate_safety_data(num_samples=args.num_samples)
+        domain_data = merger.generate_domain_data(num_samples=args.num_samples)
+        
+        optimal_params = merger.evomm_optimize(safety_data, domain_data, merge_method=args.merge_method)
+        
+        if args.merge_method == 'dare_ties':
+            merger.dare_ties_merge(optimal_params[:-1], optimal_params[-1])
+        elif args.merge_method == 'ewc':
+            fisher_importance = merger.compute_fisher_importance()
+            merger.elastic_weight_consolidation(optimal_params[:-1], fisher_importance)
+        
+        if args.fine_tune:
+            merger.fine_tune(args.fine_tune_dataset, args.fine_tune_epochs)
+        
+        safety_score, domain_scores, avg_semantic_similarity = merger.evaluate_model(merger.merged_model, safety_data, domain_data)
+        logger.info(f"Final Merged Model - Safety: {safety_score:.2f}, Domain Performances: {domain_scores}, Avg Semantic Similarity: {avg_semantic_similarity}")
+        logger.info(f"Optimal parameters: {optimal_params}")
+        
+        if args.save_model:
+            merger.save_model(args.output_dir)
 
 if __name__ == "__main__":
     main()
